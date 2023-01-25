@@ -1,9 +1,11 @@
 package dev.slimevr.platform.windows;
 
 import com.google.protobuf.CodedOutputStream;
-import com.sun.jna.platform.win32.Kernel32;
+// import com.sun.jna.platform.win32.Kernel32;
 import com.sun.jna.platform.win32.WinBase;
 import com.sun.jna.platform.win32.WinError;
+import com.sun.jna.platform.win32.WinNT;
+import com.sun.jna.platform.win32.WinNT.HANDLE;
 import com.sun.jna.ptr.IntByReference;
 import dev.slimevr.Main;
 import dev.slimevr.VRServer;
@@ -12,6 +14,7 @@ import dev.slimevr.bridge.PipeState;
 import dev.slimevr.bridge.ProtobufMessages.ProtobufMessage;
 import dev.slimevr.platform.SteamVRBridge;
 import dev.slimevr.vr.trackers.*;
+import io.eiren.util.ann.ThreadSafe;
 import io.eiren.util.logging.LogManager;
 
 import java.io.IOException;
@@ -23,6 +26,29 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 	protected final String pipeName;
 	private final byte[] buffArray = new byte[2048];
 	protected WindowsPipe pipe;
+	protected WinBase.OVERLAPPED connect_event;
+	protected WinBase.OVERLAPPED recv_event;
+	protected WinBase.OVERLAPPED send_event;
+	protected HANDLE queue_event;
+
+	protected HANDLE[] wait_send;
+	protected HANDLE[] wait_queue;
+
+	protected static HANDLE createEvent(boolean manual) throws IOException {
+		HANDLE result = Kernel32.INSTANCE.CreateEvent(null, manual, false, null);
+		if (result == WinBase.INVALID_HANDLE_VALUE) {
+			throw new IOException("Event creation error: " + Kernel32.INSTANCE.GetLastError());
+		}
+		return result;
+	}
+
+	protected static WinBase.OVERLAPPED createOverlapped() throws IOException {
+		WinBase.OVERLAPPED res = new WinBase.OVERLAPPED();
+		res.hEvent = createEvent(true);
+		res.Offset = 0;
+		res.OffsetHigh = 0;
+		return res;
+	}
 
 	public WindowsNamedPipeBridge(
 		VRServer server,
@@ -40,8 +66,37 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 	@BridgeThread
 	public void run() {
 		try {
+			connect_event = createOverlapped();
+			recv_event = createOverlapped();
+			send_event = createOverlapped();
+			queue_event = createEvent(false);
+
+			wait_send = new HANDLE[] { recv_event.hEvent, send_event.hEvent };
+			wait_queue = new HANDLE[] { recv_event.hEvent, queue_event };
 			createPipe();
+
+			boolean send_pending = false;
+
 			while (true) {
+				int object = Kernel32.INSTANCE
+					.WaitForMultipleObjects(
+						2,
+						send_pending ? wait_send : wait_queue,
+						false,
+						WinBase.INFINITE
+					);
+				switch (object - WinBase.WAIT_OBJECT_0) {
+					case 0: // recv
+
+						break;
+					case 1:
+						if (send_pending) { // send
+
+						}
+						// queue
+						break;
+					default:
+				}
 				boolean pipesUpdated = false;
 				if (pipe.state == PipeState.CREATED) {
 					tryOpeningPipe(pipe);
@@ -54,16 +109,23 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 					resetPipe();
 				}
 				if (!pipesUpdated) {
-					try {
-						Thread.sleep(5); // Up to 200Hz
-					} catch (InterruptedException e) {
-						e.printStackTrace();
-					}
+					Thread.yield();
 				}
 			}
 		} catch (IOException e) {
 			// TODO Auto-generated catch block
 			e.printStackTrace();
+		}
+	}
+
+	@Override
+	@ThreadSafe
+	protected void sendMessage(ProtobufMessage message) {
+		super.sendMessage(message);
+		if (queue_event != WinBase.INVALID_HANDLE_VALUE) {
+			// since we're going to block on WaitForMultipleObjects, we need to
+			// notify in a way that can be monitored there.
+			Kernel32.INSTANCE.SetEvent(queue_event);
 		}
 	}
 
@@ -170,7 +232,7 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 				Kernel32.INSTANCE
 					.CreateNamedPipe(
 						pipeName,
-						WinBase.PIPE_ACCESS_DUPLEX, // dwOpenMode
+						WinBase.PIPE_ACCESS_DUPLEX | WinNT.FILE_FLAG_OVERLAPPED, // dwOpenMode
 						WinBase.PIPE_TYPE_BYTE | WinBase.PIPE_READMODE_BYTE | WinBase.PIPE_WAIT, // dwPipeMode
 						1, // nMaxInstances,
 						1024 * 16, // nOutBufferSize,
@@ -193,25 +255,60 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 	}
 
 	private boolean tryOpeningPipe(WindowsPipe pipe) {
-		if (
-			Kernel32.INSTANCE.ConnectNamedPipe(pipe.pipeHandle, null)
-				|| Kernel32.INSTANCE.GetLastError() == WinError.ERROR_PIPE_CONNECTED
-		) {
-			pipe.state = PipeState.OPEN;
-			LogManager.info("[" + bridgeName + "] Pipe " + pipe.name + " is open");
-			Main.getVrServer().queueTask(this::reconnected);
-			return true;
+		// Overlapped ConnectNamedPipe should return zero.
+		if (Kernel32.INSTANCE.ConnectNamedPipe(pipe.pipeHandle, connect_event)) {
+			LogManager
+				.info(
+					"["
+						+ bridgeName
+						+ "] Immediate error connecting to pipe "
+						+ pipe.name
+						+ ": "
+						+ Kernel32.INSTANCE.GetLastError()
+				);
 		}
-		LogManager
-			.info(
-				"["
-					+ bridgeName
-					+ "] Error connecting to pipe "
-					+ pipe.name
-					+ ": "
-					+ Kernel32.INSTANCE.GetLastError()
-			);
-		return false;
+
+		IntByReference bytesRead = new IntByReference();
+
+		switch (Kernel32.INSTANCE.GetLastError()) {
+			case WinError.ERROR_IO_PENDING:
+				// TODO: named pipes can support multiple clients. We could make
+				// connect non-blocking,
+				// and handle multiple clients (i.e. feeder and driver) using
+				// the same thread.
+				boolean result = Kernel32.INSTANCE
+					.GetOverlappedResult(pipe.pipeHandle, connect_event, bytesRead, true);
+				if (!result) {
+					LogManager
+						.info(
+							"["
+								+ bridgeName
+								+ "] Error connecting to pipe "
+								+ pipe.name
+								+ ": "
+								+ Kernel32.INSTANCE.GetLastError()
+						);
+				}
+				return result;
+			case WinError.ERROR_PIPE_CONNECTED:
+				// example code at
+				// <https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-server-using-overlapped-i-o>
+				// sets an event in this case: I don't think we need to do that,
+				// since we're only calling GetOverlappedResult if
+				// the operation is pending.
+				return true;
+			default:
+				LogManager
+					.info(
+						"["
+							+ bridgeName
+							+ "] Error connecting to pipe "
+							+ pipe.name
+							+ ": "
+							+ Kernel32.INSTANCE.GetLastError()
+					);
+				return false;
+		}
 	}
 
 	@Override

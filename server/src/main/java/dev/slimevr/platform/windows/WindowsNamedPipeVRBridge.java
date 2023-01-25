@@ -2,7 +2,7 @@ package dev.slimevr.platform.windows;
 
 import com.jme3.math.Quaternion;
 import com.jme3.math.Vector3f;
-import com.sun.jna.platform.win32.Kernel32;
+//import com.sun.jna.platform.win32.Kernel32;
 import com.sun.jna.platform.win32.WinBase;
 import com.sun.jna.platform.win32.WinNT.HANDLE;
 import com.sun.jna.ptr.IntByReference;

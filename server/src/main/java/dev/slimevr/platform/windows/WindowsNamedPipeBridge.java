@@ -92,11 +92,15 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 						break;
 					case 1:
 						if (send_pending) { // send
-
+							// handleSend();
+							send_pending = false;
 						}
-						// queue
+						if (!send_pending) {
+							// startSend() if item in queue
+						}
 						break;
 					default:
+						// TODO: error
 				}
 				boolean pipesUpdated = false;
 				if (pipe.state == PipeState.CREATED) {

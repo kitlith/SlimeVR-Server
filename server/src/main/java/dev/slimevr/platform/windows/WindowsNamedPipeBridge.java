@@ -288,6 +288,8 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 								+ ": "
 								+ Kernel32.INSTANCE.GetLastError()
 						);
+				} else {
+					pipe.state = PipeState.OPEN;
 				}
 				return result;
 			case WinError.ERROR_PIPE_CONNECTED:
@@ -296,6 +298,7 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 				// sets an event in this case: I don't think we need to do that,
 				// since we're only calling GetOverlappedResult if
 				// the operation is pending.
+				pipe.state = PipeState.OPEN;
 				return true;
 			default:
 				LogManager

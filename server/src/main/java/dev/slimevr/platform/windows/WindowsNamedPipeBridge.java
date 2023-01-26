@@ -88,7 +88,7 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 					);
 				switch (object - WinBase.WAIT_OBJECT_0) {
 					case 0: // recv
-
+						handleRecv();
 						break;
 					case 1:
 						if (send_pending) { // send
@@ -160,7 +160,8 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 		Kernel32.INSTANCE.ReadFile(pipe.pipeHandle, recvBuf, recvBuf.length, null, recv_event);
 
 		int err = Kernel32.INSTANCE.GetLastError();
-		// TODO: is there a different return value for having immediately finished?
+		// TODO: is there a different return value for having immediately
+		// finished?
 		if (err != WinError.ERROR_IO_PENDING) {
 			return;
 		}
@@ -168,6 +169,23 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 		pipe.state = PipeState.ERROR;
 		LogManager
 			.severe("[" + bridgeName + "] Pipe error: " + Kernel32.INSTANCE.GetLastError());
+	}
+
+	private void handleRecv() throws IOException {
+		IntByReference bytes_recieved = new IntByReference(0);
+
+		if (
+			!Kernel32.INSTANCE
+				.GetOverlappedResult(pipe.pipeHandle, recv_event, bytes_recieved, false)
+				|| bytes_recieved.getValue() == 0
+		) {
+			pipe.state = PipeState.ERROR;
+			return;
+		}
+
+		messageReceived(ProtobufMessage.parser().parseFrom(recvBuf, 0, bytes_recieved.getValue()));
+		// we were successful, start the next read.
+		startRecv();
 	}
 
 	private boolean updatePipe() throws IOException {
@@ -248,7 +266,9 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 					.CreateNamedPipe(
 						pipeName,
 						WinBase.PIPE_ACCESS_DUPLEX | WinNT.FILE_FLAG_OVERLAPPED, // dwOpenMode
-						WinBase.PIPE_TYPE_BYTE | WinBase.PIPE_READMODE_BYTE | WinBase.PIPE_WAIT, // dwPipeMode
+						WinBase.PIPE_TYPE_MESSAGE
+							| WinBase.PIPE_READMODE_MESSAGE
+							| WinBase.PIPE_WAIT, // dwPipeMode
 						1, // nMaxInstances,
 						1024 * 16, // nOutBufferSize,
 						1024 * 16, // nInBufferSize,
@@ -270,7 +290,8 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 	}
 
 	private boolean tryOpeningPipe(WindowsPipe pipe) {
-		// Overlapped ConnectNamedPipe should return zero. Checking this may be overkill.
+		// Overlapped ConnectNamedPipe should return zero. Checking this may be
+		// overkill.
 		if (Kernel32.INSTANCE.ConnectNamedPipe(pipe.pipeHandle, connect_event)) {
 			LogManager
 				.info(

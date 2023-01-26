@@ -24,7 +24,8 @@ import java.util.List;
 public class WindowsNamedPipeBridge extends SteamVRBridge {
 
 	protected final String pipeName;
-	private final byte[] buffArray = new byte[2048];
+	private final byte[] sendBuf = new byte[2048];
+	private final byte[] recvBuf = new byte[2048];
 	protected WindowsPipe pipe;
 	protected WinBase.OVERLAPPED connect_event;
 	protected WinBase.OVERLAPPED recv_event;
@@ -135,14 +136,14 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 		if (pipe.state == PipeState.OPEN) {
 			try {
 				int size = message.getSerializedSize();
-				CodedOutputStream os = CodedOutputStream.newInstance(buffArray, 4, size);
+				CodedOutputStream os = CodedOutputStream.newInstance(sendBuf, 4, size);
 				message.writeTo(os);
 				size += 4;
-				buffArray[0] = (byte) (size & 0xFF);
-				buffArray[1] = (byte) ((size >> 8) & 0xFF);
-				buffArray[2] = (byte) ((size >> 16) & 0xFF);
-				buffArray[3] = (byte) ((size >> 24) & 0xFF);
-				if (Kernel32.INSTANCE.WriteFile(pipe.pipeHandle, buffArray, size, null, null)) {
+				sendBuf[0] = (byte) (size & 0xFF);
+				sendBuf[1] = (byte) ((size >> 8) & 0xFF);
+				sendBuf[2] = (byte) ((size >> 16) & 0xFF);
+				sendBuf[3] = (byte) ((size >> 24) & 0xFF);
+				if (Kernel32.INSTANCE.WriteFile(pipe.pipeHandle, sendBuf, size, null, null)) {
 					return true;
 				}
 				pipe.state = PipeState.ERROR;
@@ -155,19 +156,33 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 		return false;
 	}
 
+	private void startRecv() {
+		Kernel32.INSTANCE.ReadFile(pipe.pipeHandle, recvBuf, recvBuf.length, null, recv_event);
+
+		int err = Kernel32.INSTANCE.GetLastError();
+		// TODO: is there a different return value for having immediately finished?
+		if (err != WinError.ERROR_IO_PENDING) {
+			return;
+		}
+
+		pipe.state = PipeState.ERROR;
+		LogManager
+			.severe("[" + bridgeName + "] Pipe error: " + Kernel32.INSTANCE.GetLastError());
+	}
+
 	private boolean updatePipe() throws IOException {
 		if (pipe.state == PipeState.OPEN) {
 			boolean readAnything = false;
 			IntByReference bytesAvailable = new IntByReference(0);
 			while (
 				Kernel32.INSTANCE
-					.PeekNamedPipe(pipe.pipeHandle, buffArray, 4, null, bytesAvailable, null)
+					.PeekNamedPipe(pipe.pipeHandle, sendBuf, 4, null, bytesAvailable, null)
 			) {
 				if (bytesAvailable.getValue() >= 4) { // Got size
-					int messageLength = (buffArray[3] << 24)
-						| (buffArray[2] << 16)
-						| (buffArray[1] << 8)
-						| buffArray[0];
+					int messageLength = (sendBuf[3] << 24)
+						| (sendBuf[2] << 16)
+						| (sendBuf[1] << 8)
+						| sendBuf[0];
 					if (messageLength > 1024) { // Overflow
 						LogManager
 							.severe(
@@ -184,7 +199,7 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 							Kernel32.INSTANCE
 								.ReadFile(
 									pipe.pipeHandle,
-									buffArray,
+									sendBuf,
 									messageLength,
 									bytesAvailable,
 									null
@@ -192,7 +207,7 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 						) {
 							ProtobufMessage message = ProtobufMessage
 								.parser()
-								.parseFrom(buffArray, 4, messageLength - 4);
+								.parseFrom(sendBuf, 4, messageLength - 4);
 							messageReceived(message);
 							readAnything = true;
 						} else {
@@ -255,7 +270,7 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 	}
 
 	private boolean tryOpeningPipe(WindowsPipe pipe) {
-		// Overlapped ConnectNamedPipe should return zero.
+		// Overlapped ConnectNamedPipe should return zero. Checking this may be overkill.
 		if (Kernel32.INSTANCE.ConnectNamedPipe(pipe.pipeHandle, connect_event)) {
 			LogManager
 				.info(
@@ -290,6 +305,7 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 						);
 				} else {
 					pipe.state = PipeState.OPEN;
+					startRecv();
 				}
 				return result;
 			case WinError.ERROR_PIPE_CONNECTED:
@@ -310,6 +326,7 @@ public class WindowsNamedPipeBridge extends SteamVRBridge {
 							+ ": "
 							+ Kernel32.INSTANCE.GetLastError()
 					);
+				pipe.state = PipeState.ERROR;
 				return false;
 		}
 	}
